@@ -106,45 +106,193 @@ class SeatAutoBooker:
         return self.json["CODE"], self.json["MESSAGE"] + " 座位:{}".format(seat)
 
     def login(self):
-        logging.info('Login in')
+    logging.info('开始登录...')
+    
+    # 尝试多种选择器，提高兼容性
+    password_selectors = [
+        # 原始选择器
+        """//*[@id="react-root"]/div/div/div[1]/div[2]/div/div[1]/div[2]/div/div/div/div/div[1]/div[2]/div/div[3]/div/div[2]/input""",
+        # 尝试其他可能的选择器
+        "//input[@type='password']",
+        "//input[contains(@name, 'password')]",
+        "//input[contains(@placeholder, '密码')]",
+        "//input[contains(@class, 'password')]",
+    ]
+    
+    button_selectors = [
+        # 原始选择器
+        """//*[@id="react-root"]/div/div/div[1]/div[2]/div/div[1]/div[2]/div/div/div/div/div[1]/div[3]""",
+        # 尝试其他可能的选择器
+        "//button[contains(text(), '登录')]",
+        "//button[contains(text(), '登入')]",
+        "//button[contains(text(), 'Login')]",
+        "//button[@type='submit']",
+        "//div[contains(text(), '登录')]",
+        "//span[contains(text(), '登录')]",
+    ]
 
-        pwd_path_selector = """//*[@id="react-root"]/div/div/div[1]/div[2]/div/div[1]/div[2]/div/div/div/div/div[1]/div[2]/div/div[3]/div/div[2]/input"""
-        button_path_selector = """//*[@id="react-root"]/div/div/div[1]/div[2]/div/div[1]/div[2]/div/div/div/div/div[1]/div[3]"""
-
+    try:
+        logging.info('打开网站...')
+        self.driver.get("https://hdu.huitu.zhishulib.com/")
+        
+        # 等待页面加载
+        time.sleep(3)
+        
+        # 保存页面截图，用于调试
+        self.driver.save_screenshot('login_page.png')
+        print("已保存登录页面截图: login_page.png")
+        
+        # 打印页面标题和URL，用于调试
+        print(f"页面标题: {self.driver.title}")
+        print(f"页面URL: {self.driver.current_url}")
+        
+        # 尝试查找用户名输入框
+        logging.info('查找用户名输入框...')
+        username_input = None
+        
         try:
-            logging.info('开始登陆...')
-
-            self.driver.get("https://hdu.huitu.zhishulib.com/")
-            logging.debug('打开网站.')
-
-            self.wait.until(EC.presence_of_element_located((By.NAME, "login_name")))
-            logging.debug('找到用户名输入框.')
-
-            self.wait.until(EC.presence_of_element_located((By.XPATH, pwd_path_selector)))
-            logging.debug('找到密码输入框.')
-
-            self.wait.until(EC.presence_of_element_located((By.XPATH, button_path_selector)))
-            logging.debug('找到登录按钮.')
-
-            self.driver.find_element(By.NAME, 'login_name').clear()
-            self.driver.find_element(By.NAME, 'login_name').send_keys(self.un)  # 传送帐号
-            logging.info('输入用户名')
-
-            self.driver.find_element(By.XPATH, pwd_path_selector).clear()
-            self.driver.find_element(By.XPATH, pwd_path_selector).send_keys(self.pd)  # 输入密码
-            logging.info('输入密码')
-            logging.info('点击登录按钮')
-            self.driver.find_element(By.XPATH, button_path_selector).click()
-            time.sleep(5)
-            cookie_list = self.driver.get_cookies()
-            self.cookie = ";".join([item["name"] + "=" + item["value"] + "" for item in cookie_list])
-            self.cfg["headers"]['Cookie'] = self.cookie
-
-            logging.info("登录成功！")
-        except Exception as e:
-            logging.error(f"登录失败：{e}")
+            # 先尝试原来的方式
+            username_input = self.wait.until(
+                EC.presence_of_element_located((By.NAME, "login_name"))
+            )
+            print("使用By.NAME找到用户名输入框")
+        except:
+            # 如果找不到，尝试其他方式
+            try:
+                username_input = self.wait.until(
+                    EC.presence_of_element_located((By.XPATH, "//input[contains(@placeholder, '学号') or contains(@placeholder, '账号') or contains(@placeholder, '用户名')]"))
+                )
+                print("使用placeholder找到用户名输入框")
+            except:
+                try:
+                    username_input = self.wait.until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='text']"))
+                    )
+                    print("使用CSS选择器找到用户名输入框")
+                except Exception as e:
+                    print(f"未找到用户名输入框: {e}")
+                    # 保存当前页面状态以便调试
+                    with open('page_source.html', 'w', encoding='utf-8') as f:
+                        f.write(self.driver.page_source)
+                    return -1
+        
+        if username_input:
+            username_input.clear()
+            username_input.send_keys(self.un)
+            print(f"已输入用户名: {self.un}")
+            logging.info('输入用户名成功')
+        
+        # 尝试查找密码输入框
+        logging.info('查找密码输入框...')
+        password_input = None
+        
+        for selector in password_selectors:
+            try:
+                password_input = self.driver.find_element(By.XPATH, selector)
+                print(f"使用选择器找到密码输入框: {selector}")
+                break
+            except:
+                continue
+        
+        if not password_input:
+            # 如果以上选择器都找不到，尝试通用方式
+            try:
+                password_input = self.driver.find_element(By.XPATH, "//input[@type='password']")
+                print("使用type='password'找到密码输入框")
+            except:
+                try:
+                    # 尝试找到所有输入框，取第二个（假设第一个是用户名）
+                    all_inputs = self.driver.find_elements(By.TAG_NAME, "input")
+                    if len(all_inputs) >= 2:
+                        password_input = all_inputs[1]  # 假设第二个是密码
+                        print("使用第二个input作为密码输入框")
+                except Exception as e:
+                    print(f"未找到密码输入框: {e}")
+                    return -1
+        
+        if password_input:
+            password_input.clear()
+            password_input.send_keys(self.pd)
+            print("已输入密码")
+            logging.info('输入密码成功')
+        
+        # 尝试查找登录按钮
+        logging.info('查找登录按钮...')
+        login_button = None
+        
+        for selector in button_selectors:
+            try:
+                login_button = self.driver.find_element(By.XPATH, selector)
+                print(f"使用选择器找到登录按钮: {selector}")
+                break
+            except:
+                continue
+        
+        if not login_button:
+            # 尝试其他方式找到登录按钮
+            try:
+                # 查找所有按钮
+                all_buttons = self.driver.find_elements(By.TAG_NAME, "button")
+                for btn in all_buttons:
+                    if '登录' in btn.text or '登入' in btn.text or 'login' in btn.text.lower():
+                        login_button = btn
+                        print(f"通过按钮文本找到登录按钮: {btn.text}")
+                        break
+            except:
+                pass
+        
+        if not login_button:
+            print("未找到登录按钮")
             return -1
-        return 0
+        
+        # 点击登录按钮
+        logging.info('点击登录按钮...')
+        login_button.click()
+        print("已点击登录按钮")
+        
+        # 等待登录完成
+        time.sleep(5)
+        
+        # 保存登录后的页面截图
+        self.driver.save_screenshot('after_login.png')
+        print("已保存登录后页面截图: after_login.png")
+        
+        # 检查是否登录成功
+        print(f"登录后页面标题: {self.driver.title}")
+        print(f"登录后页面URL: {self.driver.current_url}")
+        
+        # 检查页面内容是否包含登录成功的关键词
+        page_text = self.driver.page_source.lower()
+        if any(keyword in page_text for keyword in ['座位', '我的', '预约', 'dashboard', 'home']):
+            print("检测到登录成功的关键词")
+            # 获取cookie
+            cookie_list = self.driver.get_cookies()
+            self.cookie = ";".join([item["name"] + "=" + item["value"] for item in cookie_list])
+            self.cfg["headers"]['Cookie'] = self.cookie
+            logging.info("登录成功！")
+            return 0
+        else:
+            print("未检测到登录成功的关键词")
+            # 保存页面源码以便调试
+            with open('failed_login_page.html', 'w', encoding='utf-8') as f:
+                f.write(self.driver.page_source)
+            return -1
+            
+    except Exception as e:
+        logging.error(f"登录失败：{e}")
+        import traceback
+        traceback.print_exc()
+        
+        # 保存错误时的页面状态
+        try:
+            self.driver.save_screenshot('login_error.png')
+            print("已保存错误页面截图: login_error.png")
+            with open('error_page_source.html', 'w', encoding='utf-8') as f:
+                f.write(self.driver.page_source)
+        except:
+            pass
+        
+        return -1
 
     def get_user_info(self):
         logging.info('Getting user info')
