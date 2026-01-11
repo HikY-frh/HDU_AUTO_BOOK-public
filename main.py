@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import json
 import os
 import logging
+import pytz  # 需要安装 pytz 包
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -20,15 +21,36 @@ logging.basicConfig(
     datefmt='%H:%M:%S',
     level=logging.DEBUG)
 
-time_zone = 8  # 时区
+# 定义时区
+UTC_TZ = pytz.UTC
+BEIJING_TZ = pytz.timezone('Asia/Shanghai')  # 北京时间
 
 
 def get_seats_with_config(user_config, date_config, seat_config):
+    """获取座位列表，支持自定义座位"""
+    # 检查是否有自定义字段（直接指定的座位号）
+    if '自定义' in date_config:
+        custom_seat = date_config['自定义']
+        print(f"使用自定义座位: {custom_seat}")
+        if isinstance(custom_seat, list):
+            return custom_seat
+        elif isinstance(custom_seat, int):
+            return [custom_seat]
+        else:
+            return []
+    
     # 二楼东/二楼西/四楼/三楼大厅/守正书院/求新书院/自定义
-    seat_name = date_config['name']
+    seat_name = date_config.get('name', '')
+    if not seat_name:
+        return []
+    
     if seat_name == "自定义":
-        return user_config['自定义']
-    return list(range(seat_config[seat_name]['begin'], seat_config[seat_name]['end']))
+        return user_config.get('自定义', [])
+    
+    if seat_name in seat_config:
+        return list(range(seat_config[seat_name].get('begin', 0), 
+                         seat_config[seat_name].get('end', 0)))
+    return []
 
 
 class SeatAutoBooker:
@@ -58,60 +80,166 @@ class SeatAutoBooker:
         chrome_options.add_experimental_option('useAutomationExtension', False)
         
         self.driver = webdriver.Chrome(service=Service('/usr/local/bin/chromedriver'), options=chrome_options)
-        self.wait = WebDriverWait(self.driver, 15, 0.5)  # 增加等待时间
+        self.wait = WebDriverWait(self.driver, 15, 0.5)
         self.cookie = None
 
         self.cfg = booker_config
 
+    def get_current_beijing_time(self):
+        """获取当前北京时间"""
+        utc_now = datetime.utcnow().replace(tzinfo=UTC_TZ)
+        beijing_now = utc_now.astimezone(BEIJING_TZ)
+        return beijing_now
+
     def book_favorite_seat(self, user_config, seat_config):
+        """预约座位"""
         # 判断是否到了预约时间
-        # 阅览室晚上9点开始预约，自习室晚上8点半开始预约
         the_day_after_tomorrow = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'][
             (datetime.now().weekday() + 2) % 7]
-        seat_type = seat_config[user_config[the_day_after_tomorrow]['name']]["type"]
-        if seat_type == "自习室":
-            start_time = datetime.now().replace(hour=20 - time_zone, minute=0, second=0, microsecond=0)
-            end_time = datetime.now().replace(hour=20 - time_zone, minute=15, second=0, microsecond=0)
+        
+        print(f"后天是: {the_day_after_tomorrow}")
+        
+        # 获取后天的配置
+        date_config = user_config.get(the_day_after_tomorrow, {})
+        if not date_config:
+            return -1, f"未找到{the_day_after_tomorrow}的配置"
+        
+        # 检查配置是否启用
+        if not date_config.get('启用', False):
+            return -1, f"{the_day_after_tomorrow}的预约未启用"
+        
+        # 判断座位类型
+        seat_name = date_config.get('name', '')
+        if '自定义' in date_config:
+            # 有自定义座位，默认使用自习室类型
+            seat_type = "自习室"
+            print("使用自定义座位，类型: 自习室")
+        elif seat_name and seat_name in seat_config:
+            seat_type = seat_config[seat_name].get("type", "自习室")
+            print(f"座位名称: {seat_name}, 类型: {seat_type}")
         else:
-            start_time = datetime.now().replace(hour=21 - time_zone, minute=0, second=0, microsecond=0)
-            end_time = datetime.now().replace(hour=21 - time_zone, minute=15, second=0, microsecond=0)
-        start_time = start_time - timedelta(minutes=self.cfg["cron-delta-minutes"])
-        if datetime.now() < start_time or datetime.now() > end_time:
-            return -1, "未到预约时间"
-        logging.info('Booking favorite seat')
-        retry_sleep_time = timedelta(minutes=self.cfg["cron-delta-minutes"]).seconds * 2 / (
-                    self.cfg["max-retry"] - 2) - 10
-        for tried_times in range(self.cfg["max-retry"]):
+            seat_type = "自习室"  # 默认类型
+            print(f"未找到座位配置，使用默认类型: {seat_type}")
+        
+        # 获取当前北京时间
+        beijing_now = self.get_current_beijing_time()
+        print(f"当前北京时间: {beijing_now.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # 设置预约时间（根据座位类型）
+        if seat_type == "自习室":
+            # 自习室：晚上20:00-20:15（北京时间）
+            booking_start = beijing_now.replace(hour=20, minute=0, second=0, microsecond=0)
+            booking_end = beijing_now.replace(hour=20, minute=15, second=0, microsecond=0)
+        else:
+            # 阅览室：晚上21:00-21:15（北京时间）
+            booking_start = beijing_now.replace(hour=21, minute=0, second=0, microsecond=0)
+            booking_end = beijing_now.replace(hour=21, minute=15, second=0, microsecond=0)
+        
+        # 考虑提前量
+        booking_start = booking_start - timedelta(minutes=self.cfg.get("cron-delta-minutes", 0))
+        
+        print(f"预约窗口开始: {booking_start.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"预约窗口结束: {booking_end.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        if beijing_now < booking_start:
+            wait_seconds = (booking_start - beijing_now).seconds
+            wait_minutes = wait_seconds // 60
+            return -1, f"未到预约时间，还需等待{wait_minutes}分{wait_seconds%60}秒"
+        if beijing_now > booking_end:
+            return -1, "已超过预约时间"
+        
+        print("✅ 在预约时间窗口内，开始预约...")
+        
+        logging.info('开始预约座位')
+        retry_sleep_time = timedelta(minutes=self.cfg.get("cron-delta-minutes", 5)).seconds * 2 / (
+                    self.cfg.get("max-retry", 5) - 2) - 10
+        
+        for tried_times in range(self.cfg.get("max-retry", 5)):
             try:
-                return self._book_favorite_seat(user_config, seat_config, tried_times)
+                result_code, result_message = self._book_favorite_seat(user_config, seat_config, tried_times)
+                print(f"第{tried_times+1}次尝试: {result_message}")
+                if result_code == 0:
+                    return result_code, result_message
+                time.sleep(retry_sleep_time)
             except Exception as e:
                 logging.exception(e)
-                print(e.__class__, "尝试第{}次".format(tried_times))
+                print(e.__class__, f"尝试第{tried_times+1}次失败")
                 time.sleep(retry_sleep_time)
+        
+        return -1, "达到最大重试次数，预约失败"
 
     def _book_favorite_seat(self, user_config, seat_config, tried_times=0):
-        logging.info('Entering _book_favorite_seat method')
+        logging.info('预约座位详细方法')
         the_day_after_tomorrow = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'][
             (datetime.now().weekday() + 2) % 7]
-        date_config = user_config[the_day_after_tomorrow]
+        
+        date_config = user_config.get(the_day_after_tomorrow, {})
+        
+        # 获取座位列表
         seats = get_seats_with_config(user_config, date_config, seat_config)
-        today_0_clock = datetime.strptime(datetime.now().strftime("%Y-%m-%d 00:00:00"), "%Y-%m-%d %H:%M:%S")
-        book_time = today_0_clock + timedelta(days=2) + timedelta(hours=date_config['开始时间'])
-        delta = book_time - self.cfg["start-time"]
-        total_seconds = delta.days * 24 * 3600 + delta.seconds
-        if date_config['name'] == '自定义' and tried_times < self.cfg["max-retry"] / 3 * 2:
-            seat = seats[0]
+        if not seats:
+            return -1, "没有可用的座位"
+        
+        print(f"可用座位列表: {seats}")
+        
+        # 计算预约时间（使用北京时间）
+        beijing_now = self.get_current_beijing_time()
+        today_0_clock = beijing_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        # 使用配置文件中的开始时间
+        start_hour = date_config.get('开始时间', 0)
+        book_time = today_0_clock + timedelta(days=2) + timedelta(hours=start_hour)
+        
+        # 计算从基准时间开始的秒数
+        # 注意：基准时间也需要转换为北京时间
+        if isinstance(self.cfg["start-time"], str):
+            # 如果基准时间是字符串，解析它
+            base_time = datetime.strptime(self.cfg["start-time"], "%Y-%m-%d %H:%M:%S")
+            base_time = BEIJING_TZ.localize(base_time)
         else:
-            seat = random.choice(seats)
-        data = f"beginTime={total_seconds}&duration={3600 * date_config['持续小时数']}&&seats[0]={seat}&seatBookers[0]={self.user_data['uid']}"
+            # 如果已经是datetime对象
+            base_time = self.cfg["start-time"]
+            if base_time.tzinfo is None:
+                base_time = BEIJING_TZ.localize(base_time)
+        
+        delta = book_time - base_time
+        total_seconds = delta.days * 24 * 3600 + delta.seconds
+        
+        print(f"预约使用时间: {book_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"基准时间: {base_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"时间差(秒): {total_seconds}")
+        
+        # 选择座位
+        if '自定义' in date_config and tried_times < self.cfg.get("max-retry", 5) / 3 * 2:
+            seat = seats[0] if seats else 0
+        else:
+            seat = random.choice(seats) if seats else 0
+        
+        print(f"选择座位: {seat}")
+        
+        # 构建预约请求数据
+        duration_hours = date_config.get('持续小时数', 2)
+        data = f"beginTime={total_seconds}&duration={3600 * duration_hours}&&seats[0]={seat}&seatBookers[0]={self.user_data['uid']}"
 
         headers = self.cfg["headers"]
         headers['Cookie'] = self.cookie
-        print(data)
-        self.resp = requests.post(self.cfg["target"], data=data, headers=headers)
-        self.json = json.loads(self.resp.text)
-        return self.json["CODE"], self.json["MESSAGE"] + " 座位:{}".format(seat)
+        print(f"预约请求数据: {data}")
+        
+        try:
+            self.resp = requests.post(self.cfg["target"], data=data, headers=headers, timeout=10)
+            self.json = json.loads(self.resp.text)
+            print(f"预约响应: {self.json}")
+            
+            # 检查预约结果
+            if self.json.get("CODE") == 0:
+                return 0, self.json.get("MESSAGE", "预约成功") + f" 座位:{seat}"
+            else:
+                return self.json.get("CODE", -1), self.json.get("MESSAGE", "预约失败") + f" 座位:{seat}"
+        except Exception as e:
+            print(f"请求失败: {str(e)}")
+            return -1, f"请求失败: {str(e)}"
 
+    # 以下方法保持不变（login, get_user_info等）
     def login(self):
         logging.info('开始登录...')
         
@@ -119,25 +247,18 @@ class SeatAutoBooker:
             logging.info('打开图书馆网站...')
             self.driver.get("https://hdu.huitu.zhishulib.com/")
             
-            # 等待页面加载
             time.sleep(5)
             
             print(f"当前页面标题: {self.driver.title}")
             print(f"当前页面URL: {self.driver.current_url}")
             
-            # 保存当前页面截图
             self.driver.save_screenshot('initial_page.png')
-            print("已保存初始页面截图: initial_page.png")
             
-            # 检查是否已经登录成功
             current_url = self.driver.current_url
-            page_source = self.driver.page_source
             
-            # 如果已经在图书馆网站且不是登录页面，可能已自动登录
             if 'huitu.zhishulib.com' in current_url and 'sso.hdu.edu.cn' not in current_url:
                 print("已在图书馆网站，检查是否已登录...")
                 
-                # 尝试获取cookie
                 try:
                     cookie_list = self.driver.get_cookies()
                     if cookie_list:
@@ -145,14 +266,12 @@ class SeatAutoBooker:
                         self.cfg["headers"]['Cookie'] = self.cookie
                         print(f"获取到 {len(cookie_list)} 个Cookie")
                         
-                        # 验证登录状态
                         if self._test_login_status():
                             print("✅ 已自动登录成功！")
                             return 0
                 except Exception as e:
                     print(f"获取Cookie失败: {e}")
             
-            # 检查是否在SSO页面
             if 'sso.hdu.edu.cn' in current_url:
                 print("检测到在统一身份认证平台(SSO)页面")
                 return self._handle_sso_login()
@@ -195,7 +314,6 @@ class SeatAutoBooker:
         print("开始处理SSO登录...")
         
         try:
-            # 先等待几秒，看是否会自动跳转（可能已经有session）
             for i in range(10):
                 time.sleep(1)
                 current_url = self.driver.current_url
@@ -204,22 +322,18 @@ class SeatAutoBooker:
                 if 'huitu.zhishulib.com' in current_url and 'sso.hdu.edu.cn' not in current_url:
                     print("检测到自动跳转回图书馆网站")
                     
-                    # 获取cookie
                     cookie_list = self.driver.get_cookies()
                     self.cookie = ";".join([item["name"] + "=" + item["value"] for item in cookie_list])
                     self.cfg["headers"]['Cookie'] = self.cookie
                     
-                    # 验证登录状态
                     if self._test_login_status():
                         print("✅ SSO自动登录成功！")
                         return 0
                     break
             
-            # 如果未自动跳转，尝试手动登录
             print("未自动跳转，尝试手动登录...")
             self.driver.save_screenshot('sso_page.png')
             
-            # 尝试查找并填写表单
             return self._try_sso_manual_login()
                 
         except Exception as e:
@@ -231,19 +345,12 @@ class SeatAutoBooker:
     def _try_sso_manual_login(self):
         """尝试SSO手动登录"""
         try:
-            # 查找所有input元素
             all_inputs = self.driver.find_elements(By.TAG_NAME, "input")
             print(f"找到 {len(all_inputs)} 个input元素")
             
-            # 查找所有button元素
             all_buttons = self.driver.find_elements(By.TAG_NAME, "button")
             print(f"找到 {len(all_buttons)} 个button元素")
             
-            # 查找所有表单元素
-            all_forms = self.driver.find_elements(By.TAG_NAME, "form")
-            print(f"找到 {len(all_forms)} 个form元素")
-            
-            # 尝试找到用户名输入框（通常第一个文本输入框）
             username_input = None
             for inp in all_inputs:
                 try:
@@ -255,12 +362,10 @@ class SeatAutoBooker:
                 except:
                     continue
             
-            # 如果没找到，尝试第一个input
             if not username_input and all_inputs:
                 username_input = all_inputs[0]
                 print("使用第一个input作为用户名输入框")
             
-            # 尝试找到密码输入框
             password_input = None
             for inp in all_inputs:
                 try:
@@ -272,12 +377,10 @@ class SeatAutoBooker:
                 except:
                     continue
             
-            # 如果没找到，尝试第二个input
             if not password_input and len(all_inputs) > 1:
                 password_input = all_inputs[1]
                 print("使用第二个input作为密码输入框")
             
-            # 查找登录按钮
             login_button = None
             for btn in all_buttons:
                 try:
@@ -289,12 +392,10 @@ class SeatAutoBooker:
                 except:
                     continue
             
-            # 如果没找到，尝试第一个button
             if not login_button and all_buttons:
                 login_button = all_buttons[0]
                 print("使用第一个button作为登录按钮")
             
-            # 检查是否找到必要元素
             if not username_input:
                 print("❌ 未找到用户名输入框")
                 return -1
@@ -307,13 +408,11 @@ class SeatAutoBooker:
                 print("❌ 未找到登录按钮")
                 return -1
             
-            # 输入用户名和密码
             print(f"输入用户名: {self.un}")
             try:
                 username_input.clear()
                 username_input.send_keys(self.un)
             except:
-                # 尝试JavaScript方式
                 self.driver.execute_script("arguments[0].value = arguments[1];", username_input, self.un)
             
             print("输入密码")
@@ -321,21 +420,16 @@ class SeatAutoBooker:
                 password_input.clear()
                 password_input.send_keys(self.pd)
             except:
-                # 尝试JavaScript方式
                 self.driver.execute_script("arguments[0].value = arguments[1];", password_input, self.pd)
             
-            # 保存登录前截图
             self.driver.save_screenshot('before_sso_login.png')
             
-            # 点击登录按钮
             print("点击登录按钮")
             try:
                 login_button.click()
             except:
-                # 尝试JavaScript方式
                 self.driver.execute_script("arguments[0].click();", login_button)
             
-            # 等待登录完成
             for i in range(15):
                 time.sleep(1)
                 current_url = self.driver.current_url
@@ -344,21 +438,17 @@ class SeatAutoBooker:
                 if 'huitu.zhishulib.com' in current_url and 'sso.hdu.edu.cn' not in current_url:
                     print("✅ 成功重定向到图书馆网站")
                     
-                    # 获取cookie
                     cookie_list = self.driver.get_cookies()
                     self.cookie = ";".join([item["name"] + "=" + item["value"] for item in cookie_list])
                     self.cfg["headers"]['Cookie'] = self.cookie
                     
-                    # 验证登录
                     if self._test_login_status():
                         print("✅ SSO手动登录成功！")
                         return 0
                     break
             
-            # 检查是否登录成功
             self.driver.save_screenshot('after_sso_login.png')
             
-            # 最终检查
             if self._test_login_status():
                 print("✅ 登录成功！")
                 return 0
@@ -376,7 +466,6 @@ class SeatAutoBooker:
         """原来的登录方式（备用）"""
         print("使用原登录页面...")
         
-        # 原有的登录代码
         pwd_path_selector = """//*[@id="react-root"]/div/div/div[1]/div[2]/div/div[1]/div[2]/div/div/div/div/div[1]/div[2]/div/div[3]/div/div[2]/input"""
         button_path_selector = """//*[@id="react-root"]/div/div/div[1]/div[2]/div/div[1]/div[2]/div/div/div/div/div[1]/div[3]"""
 
@@ -446,7 +535,7 @@ class SeatAutoBooker:
 
 
 def is_booking_enable(date_cfg):
-    if date_cfg['启用']:
+    if isinstance(date_cfg, dict) and date_cfg.get('启用', False):
         return True
     return False
 
@@ -454,28 +543,46 @@ def is_booking_enable(date_cfg):
 if __name__ == "__main__":
     logging.info('Start of the program')
     
-    # 添加时间信息
-    print(f"脚本开始时间: {datetime.now()}")
+    # 获取当前北京时间
+    beijing_now = datetime.utcnow().replace(tzinfo=pytz.UTC).astimezone(pytz.timezone('Asia/Shanghai'))
+    print(f"脚本开始北京时间: {beijing_now.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"今天是: {beijing_now.strftime('%Y-%m-%d %A')}")
     
-    with open("user_config.yml", 'r') as f_obj:
-        user_config = yaml.safe_load(f_obj)
-    with open("config/basic_config.yml", 'r') as f_obj:
-        basic_config = yaml.safe_load(f_obj)
-    with open("config/seat_config.yml", 'r') as f_obj:
-        seat_config = yaml.safe_load(f_obj)
+    the_day_after_tomorrow = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'][(beijing_now.weekday() + 2) % 7]
+    print(f"后天是: {the_day_after_tomorrow}")
+    
+    try:
+        with open("user_config.yml", 'r') as f_obj:
+            user_config = yaml.safe_load(f_obj)
+        print(f"user_config 加载成功，后天({the_day_after_tomorrow})的配置: {user_config.get(the_day_after_tomorrow, {})}")
+        
+        with open("config/basic_config.yml", 'r') as f_obj:
+            basic_config = yaml.safe_load(f_obj)
+        print(f"basic_config 加载成功")
+        
+        with open("config/seat_config.yml", 'r') as f_obj:
+            seat_config = yaml.safe_load(f_obj)
+        print(f"seat_config 加载成功，可用座位类型: {list(seat_config.keys())}")
+        
+    except Exception as e:
+        print(f"配置文件加载失败: {e}")
+        exit(1)
 
-    the_day_after_tomorrow = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'][(datetime.now().weekday() + 2) % 7]
-    if not is_booking_enable(user_config[the_day_after_tomorrow]):
+    # 检查后天的预约是否启用
+    day_config = user_config.get(the_day_after_tomorrow, {})
+    if not day_config:
+        print(f"错误: user_config.yml 中没有找到 {the_day_after_tomorrow} 的配置")
+        exit(1)
+    
+    if not is_booking_enable(day_config):
         logging.info('预约未启用')
-        print("预约未启用")
+        print(f"{the_day_after_tomorrow}的预约未启用")
         exit(0)
-
+    
     s = SeatAutoBooker(basic_config["SeatAutoBooker"])
     
-    # 尝试直接获取用户信息（可能已经自动登录）
     print("\n=== 尝试直接获取用户信息 ===")
     try:
-        # 先获取当前cookie
         cookie_list = s.driver.get_cookies()
         if cookie_list:
             s.cookie = ";".join([item["name"] + "=" + item["value"] for item in cookie_list])
@@ -489,7 +596,6 @@ if __name__ == "__main__":
     else:
         print("❌ 直接获取用户信息失败，开始登录流程")
         
-        # 登录重试机制
         max_login_attempts = 3
         login_success = False
         
@@ -514,14 +620,11 @@ if __name__ == "__main__":
             print("❌ 登录失败，已达到最大重试次数")
             exit(-1)
     
-    # 执行预约
     print("\n=== 开始预约 ===")
     result_code, result_message = s.book_favorite_seat(user_config=user_config, seat_config=seat_config)
     
-    # 输出结果
     print(f"\n预约结果: 代码={result_code}, 消息={result_message}")
     
-    # 发送通知（如果有配置）
     if result_code == 0:
         s.wechatNotice("预约成功", result_message)
     else:
