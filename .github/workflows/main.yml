@@ -38,3 +38,7 @@ jobs:
           PASSWORD: ${{ secrets.PASSWORD }}
           SCKEY: ${{ secrets.SCKEY }}
         run: python main.py
+      - name: Check current time
+        run: |
+          echo "UTC时间: $(date -u)"
+          echo "北京时间: $(TZ='Asia/Shanghai' date)"
